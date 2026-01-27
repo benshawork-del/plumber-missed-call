@@ -1,0 +1,16 @@
+{
+  "name": "plumber-missed-call",
+  "version": "1.0.0",
+  "description": "Missed call SMS automation for plumbers",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "twilio": "^4.21.0"
+  }
+}

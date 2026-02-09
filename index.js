@@ -17,40 +17,50 @@ const client = twilio(
   TWILIO_AUTH_TOKEN
 );
 
-// Health check (Railway NEEDS this)
+// Health check
 app.get("/", (req, res) => {
-  res.send("Plumber server running ✅");
+  res.send("Server is running");
 });
 
 // Twilio webhook
 app.post("/twilio", async (req, res) => {
   try {
     const from = req.body.From;
-    const body = req.body.Body || "";
+    const body = req.body.Body || "Missed call";
 
-    // Auto-reply to customer
+    console.log("Incoming from:", from);
+
+    // SMS to customer
     await client.messages.create({
       from: TWILIO_PHONE_NUMBER,
       to: from,
-      body: "Sorry we missed your call. Reply YES and we’ll call you back."
+      body:
+        "Hi — sorry we missed your call. Reply YES and we'll call you straight back."
     });
 
-    // Notify plumber
-      await client.messages.create({
-    from: TWILIO_PHONE_NUMBER,
-    to: PLUMBER_PHONE_NUMBER,
-    body: `Missed call lead 🚨 Number: ${from}`
-  });
+    // SMS to plumber
+    await client.messages.create({
+      from: TWILIO_PHONE_NUMBER,
+      to: PLUMBER_PHONE_NUMBER,
+      body: `Missed call lead 🚨 Number: ${from}`
+    });
 
-  res.type("text/xml");
-  res.send(`
+    // Hang up call instantly
+    res.type("text/xml");
+    res.send(`
 <Response>
   <Hangup/>
 </Response>
 `);
+
+  } catch (err) {
+    console.error("Webhook error:", err);
+    res.send("<Response></Response>");
+  }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
+
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running on port", PORT);
 });

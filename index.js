@@ -32,22 +32,22 @@ app.post("/twilio", async (req, res) => {
     await client.messages.create({
       from: TWILIO_PHONE_NUMBER,
       to: from,
-      body: "Sorry we missed your call 👋 Reply YES and we’ll call you back."
+      body: "Sorry we missed your call. Reply YES and we’ll call you back."
     });
 
     // Notify plumber
-    await client.messages.create({
-      from: TWILIO_PHONE_NUMBER,
-      to: PLUMBER_PHONE_NUMBER,
-      body: `Missed call or message from ${from}`
-    });
+      await client.messages.create({
+    from: TWILIO_PHONE_NUMBER,
+    to: PLUMBER_PHONE_NUMBER,
+    body: `Missed call lead 🚨 Number: ${from}`
+  });
 
-    res.type("text/xml");
-    res.send("<Response></Response>");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Error");
-  }
+  res.type("text/xml");
+  res.send(`
+<Response>
+  <Hangup/>
+</Response>
+`);
 });
 
 const PORT = process.env.PORT || 3000;

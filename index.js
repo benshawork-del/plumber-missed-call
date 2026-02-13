@@ -3,7 +3,8 @@ const twilio = require("twilio");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+
+let lastCaller = null;
 
 const {
   TWILIO_ACCOUNT_SID,
@@ -26,11 +27,30 @@ app.get("/", (req, res) => {
 app.post("/twilio", async (req, res) => {
   try {
     const from = req.body.From;
-    const body = req.body.Body || "Missed call";
+    const body = req.body.Body || "";
 
     console.log("Incoming from:", from);
 
-    // SMS to customer
+    // Save last caller for YES replies
+    if (from) {
+      lastCaller = from;
+    }
+
+    const incomingMsg = body.trim().toLowerCase();
+
+    // ----- YES auto reply -----
+    if (incomingMsg === "yes" && lastCaller) {
+      await client.messages.create({
+        from: TWILIO_PHONE_NUMBER,
+        to: lastCaller,
+        body: "Plumber is calling you back shortly."
+      });
+
+      res.type("text/xml");
+      return res.send("<Response></Response>");
+    }
+
+    // ----- Normal missed call flow -----
     await client.messages.create({
       from: TWILIO_PHONE_NUMBER,
       to: from,
@@ -38,14 +58,13 @@ app.post("/twilio", async (req, res) => {
         "Hi — sorry we missed your call. Reply YES and we'll call you straight back."
     });
 
-    // SMS to plumber
     await client.messages.create({
       from: TWILIO_PHONE_NUMBER,
       to: PLUMBER_PHONE_NUMBER,
       body: `Missed call lead 🚨 Number: ${from}`
     });
 
-    // Hang up call instantly
+    // Hang up instantly
     res.type("text/xml");
     res.send(`
 <Response>
@@ -55,6 +74,7 @@ app.post("/twilio", async (req, res) => {
 
   } catch (err) {
     console.error("Webhook error:", err);
+    res.type("text/xml");
     res.send("<Response></Response>");
   }
 });

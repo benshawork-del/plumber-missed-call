@@ -1,7 +1,9 @@
 const express = require("express");
 const twilio = require("twilio");
+const redis = require("redis");
 
 const app = express();
+
 app.use(express.urlencoded({ extended: false }));
 
 const {
@@ -10,23 +12,50 @@ const {
   TWILIO_PHONE_NUMBER,
   PLUMBER_PHONE_NUMBER,
   TWILIO_US_NUMBER,
-  TWILIO_UK_NUMBER
+  TWILIO_UK_NUMBER,
+  REDIS_URL
 } = process.env;
+
+/* =========================
+   TWILIO CLIENT
+========================= */
 
 const client = twilio(
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN
 );
 
-// State tracking
-const userState = {};
+/* =========================
+   REDIS CLIENT
+========================= */
 
-// Health check
+const redisClient = redis.createClient({
+  url: REDIS_URL
+});
+
+redisClient.on("error", (err) => {
+  console.error("Redis error:", err);
+});
+
+(async () => {
+  await redisClient.connect();
+  console.log("Connected to Redis");
+})();
+
+/* =========================
+   HEALTH CHECK
+========================= */
+
 app.get("/", (req, res) => {
   res.send("Server is running");
 });
 
+/* =========================
+   TWILIO WEBHOOK
+========================= */
+
 app.post("/twilio", async (req, res) => {
+
   try {
 
     const from = req.body.From;
@@ -36,17 +65,45 @@ app.post("/twilio", async (req, res) => {
 
     const incomingMsg = body.trim().toLowerCase();
 
-    // SAFER NUMBER CHECK
+    // GET USER STATE FROM REDIS
+    const state = await redisClient.get(from);
+
+    // NUMBER CHECK
     const isUSNumber = to.trim() === TWILIO_US_NUMBER;
 
-    // BETTER LOGGING
+    /* =========================
+       LOGGING
+    ========================== */
+
     console.log("Incoming from:", from);
     console.log("Twilio number used:", to);
     console.log("Message body:", body);
     console.log("Media count:", numMedia);
-    console.log("Is US number:", isUSNumber);
+    console.log("User state:", state);
 
     if (!from) {
+      return res.send("<Response></Response>");
+    }
+
+    /* =========================
+       STOP / CANCEL
+    ========================== */
+
+    if (
+      incomingMsg === "stop" ||
+      incomingMsg === "cancel" ||
+      incomingMsg === "exit"
+    ) {
+
+      await redisClient.del(from);
+
+      await client.messages.create({
+        from: to,
+        to: from,
+        body:
+          "Conversation ended.\nReply YES anytime to start again."
+      });
+
       return res.send("<Response></Response>");
     }
 
@@ -67,7 +124,7 @@ app.post("/twilio", async (req, res) => {
         to: PLUMBER_PHONE_NUMBER,
         body:
           `📸 Customer sent images\n` +
-          `Number: ${from}\n` +
+          `Number: ${from}\n\n` +
           `Images:\n${mediaLinks.join("\n")}`
       });
 
@@ -84,7 +141,11 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: from,
         body:
-          "Great — plumber will call you shortly.\n\nReply:\n1 for Emergency\n2 for Non-Urgent\n3 for Quote"
+          "Great — plumber will call you shortly.\n\n" +
+          "Reply with a number:\n" +
+          "1️⃣ Emergency\n" +
+          "2️⃣ Non-Urgent\n" +
+          "3️⃣ Quote"
       });
 
       return res.send("<Response></Response>");
@@ -96,12 +157,16 @@ app.post("/twilio", async (req, res) => {
 
     if (incomingMsg === "1") {
 
-      userState[from] = "awaiting_emergency_description";
+      await redisClient.set(
+        from,
+        "awaiting_emergency_description"
+      );
 
       await client.messages.create({
         from: to,
         to: from,
-        body: "Please briefly describe your emergency issue."
+        body:
+          "Please briefly describe your emergency issue."
       });
 
       return res.send("<Response></Response>");
@@ -113,12 +178,16 @@ app.post("/twilio", async (req, res) => {
 
     if (incomingMsg === "2") {
 
-      userState[from] = "awaiting_nonurgent_description";
+      await redisClient.set(
+        from,
+        "awaiting_nonurgent_description"
+      );
 
       await client.messages.create({
         from: to,
         to: from,
-        body: "Please briefly describe the issue."
+        body:
+          "Please briefly describe the issue."
       });
 
       return res.send("<Response></Response>");
@@ -130,7 +199,10 @@ app.post("/twilio", async (req, res) => {
 
     if (incomingMsg === "3") {
 
-      userState[from] = "awaiting_quote";
+      await redisClient.set(
+        from,
+        "awaiting_quote"
+      );
 
       await client.messages.create({
         from: to,
@@ -144,10 +216,10 @@ app.post("/twilio", async (req, res) => {
     }
 
     /* =========================
-       DESCRIPTION HANDLING
+       EMERGENCY DESCRIPTION
     ========================== */
 
-    if (userState[from] === "awaiting_emergency_description") {
+    if (state === "awaiting_emergency_description") {
 
       await client.messages.create({
         from: to,
@@ -158,12 +230,16 @@ app.post("/twilio", async (req, res) => {
           `Issue: ${body}`
       });
 
-      delete userState[from];
+      await redisClient.del(from);
 
       return res.send("<Response></Response>");
     }
 
-    if (userState[from] === "awaiting_nonurgent_description") {
+    /* =========================
+       NON URGENT DESCRIPTION
+    ========================== */
+
+    if (state === "awaiting_nonurgent_description") {
 
       await client.messages.create({
         from: to,
@@ -174,12 +250,16 @@ app.post("/twilio", async (req, res) => {
           `Issue: ${body}`
       });
 
-      delete userState[from];
+      await redisClient.del(from);
 
       return res.send("<Response></Response>");
     }
 
-    if (userState[from] === "awaiting_quote") {
+    /* =========================
+       QUOTE DESCRIPTION
+    ========================== */
+
+    if (state === "awaiting_quote") {
 
       await client.messages.create({
         from: to,
@@ -190,7 +270,7 @@ app.post("/twilio", async (req, res) => {
           `Details: ${body}`
       });
 
-      delete userState[from];
+      await redisClient.del(from);
 
       return res.send("<Response></Response>");
     }
@@ -203,13 +283,16 @@ app.post("/twilio", async (req, res) => {
       from: to,
       to: from,
       body:
-        "Hi — sorry we missed your call.\nReply YES and we'll respond immediately."
+        "Hi — sorry we missed your call.\n\n" +
+        "Reply YES and we'll respond immediately."
     });
 
     await client.messages.create({
       from: to,
       to: PLUMBER_PHONE_NUMBER,
-      body: `📞 Missed call lead\nNumber: ${from}`
+      body:
+        `📞 Missed call lead\n` +
+        `Number: ${from}`
     });
 
     res.type("text/xml");
@@ -225,14 +308,15 @@ app.post("/twilio", async (req, res) => {
     console.error("Webhook error:", err);
 
     res.send("<Response></Response>");
-
   }
 });
+
+/* =========================
+   START SERVER
+========================= */
 
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
-
   console.log("Server running on port", PORT);
-
 });

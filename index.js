@@ -16,6 +16,27 @@ const {
   REDIS_URL
 } = process.env;
 
+const requiredEnvironmentVariables = [
+  "TWILIO_ACCOUNT_SID",
+  "TWILIO_AUTH_TOKEN",
+  "TWILIO_PHONE_NUMBER",
+  "PLUMBER_PHONE_NUMBER",
+  "TWILIO_US_NUMBER",
+  "TWILIO_UK_NUMBER",
+  "REDIS_URL"
+];
+
+const missingEnvironmentVariables = requiredEnvironmentVariables.filter(
+  (name) => !process.env[name] || !process.env[name].trim()
+);
+
+if (missingEnvironmentVariables.length > 0) {
+  console.error(
+    `Startup configuration error: missing required environment variable(s): ${missingEnvironmentVariables.join(", ")}`
+  );
+  process.exit(1);
+}
+
 /* =========================
    TWILIO CLIENT
 ========================= */
@@ -37,10 +58,16 @@ redisClient.on("error", (err) => {
   console.error("Redis error:", err);
 });
 
-(async () => {
-  await redisClient.connect();
-  console.log("Connected to Redis");
-})();
+async function connectToRedis() {
+  try {
+    await redisClient.connect();
+    console.log("Connected to Redis");
+  } catch (err) {
+    console.error("Unable to connect to Redis at startup:", err);
+  }
+}
+
+connectToRedis();
 
 /* =========================
    HEALTH CHECK
@@ -50,6 +77,16 @@ app.get("/", (req, res) => {
   res.send("Server is running");
 });
 
+app.get("/health", (req, res) => {
+  const redisConnected = redisClient.isReady;
+
+  res.status(redisConnected ? 200 : 503).json({
+    status: redisConnected ? "ok" : "degraded",
+    application: "running",
+    redis: redisConnected ? "connected" : "disconnected"
+  });
+});
+
 /* =========================
    TWILIO WEBHOOK
 ========================= */
@@ -57,6 +94,11 @@ app.get("/", (req, res) => {
 app.post("/twilio", async (req, res) => {
 
   try {
+
+    if (!redisClient.isReady) {
+      console.error("Twilio webhook rejected because Redis is unavailable");
+      return res.status(503).type("text/xml").send("<Response></Response>");
+    }
 
     const from = req.body.From;
     const to = req.body.To;

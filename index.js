@@ -206,7 +206,8 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: from,
         body:
-          "Please briefly describe your emergency issue."
+          "🚨 Emergency request selected.\n\n" +
+          "Please briefly describe what has happened and where the problem is."
       });
 
       return res.send("<Response></Response>");
@@ -227,7 +228,8 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: from,
         body:
-          "Please briefly describe the issue."
+          "🔧 Non-urgent repair selected.\n\n" +
+          "Please briefly describe the issue and where the problem is."
       });
 
       return res.send("<Response></Response>");
@@ -248,8 +250,11 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: from,
         body: isUSNumber
-          ? "Please reply with photos or a description of the issue for a quote."
-          : "Please reply with a description of the issue for a quote."
+          ? "💷 Quote request selected.\n\n" +
+            "Please send a description of the work you'd like a quote for. " +
+            "You can also send photos of the issue."
+          : "💷 Quote request selected.\n\n" +
+            "Please send a description of the work you'd like a quote for."
       });
 
       return res.send("<Response></Response>");
@@ -265,12 +270,26 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: PLUMBER_PHONE_NUMBER,
         body:
-          `🚨 EMERGENCY LEAD\n` +
-          `Customer: ${from}\n` +
-          `Issue: ${body}`
+          `🚨 NEW EMERGENCY LEAD\n\n` +
+          `📞 Customer: ${from}\n` +
+          `🔧 Issue:\n${body}\n\n` +
+          `⚠️ Priority: EMERGENCY\n\n` +
+          `Customer has been informed that you've been alerted.`
       });
 
       await redisClient.del(from);
+
+      await client.messages.create({
+        from: to,
+        to: from,
+        body:
+          "Thanks, we've received your emergency request. 🚨\n\n" +
+          "We've sent the details of the issue, along with your contact " +
+          "number, directly to the plumber and they've been alerted.\n\n" +
+          "They'll review the information and contact you as soon as possible.\n\n" +
+          "If the situation is getting worse or presents an immediate danger, " +
+          "please take appropriate action to keep yourself safe."
+      });
 
       return res.send("<Response></Response>");
     }
@@ -285,12 +304,25 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: PLUMBER_PHONE_NUMBER,
         body:
-          `🔧 NON-URGENT LEAD\n` +
-          `Customer: ${from}\n` +
-          `Issue: ${body}`
+          `🔧 NEW NON-URGENT LEAD\n\n` +
+          `📞 Customer: ${from}\n` +
+          `🔧 Issue:\n${body}\n\n` +
+          `📋 Priority: NON-URGENT\n\n` +
+          `Customer has been informed that you've received the details.`
       });
 
       await redisClient.del(from);
+
+      await client.messages.create({
+        from: to,
+        to: from,
+        body:
+          "Thanks, we've got the details. 👍\n\n" +
+          "We've passed your issue and contact details directly to the " +
+          "plumber, and they've been notified of your request.\n\n" +
+          "They'll review the problem and get back to you to discuss the next steps.\n\n" +
+          "You don't need to do anything else for now."
+      });
 
       return res.send("<Response></Response>");
     }
@@ -305,12 +337,26 @@ app.post("/twilio", async (req, res) => {
         from: to,
         to: PLUMBER_PHONE_NUMBER,
         body:
-          `💬 QUOTE REQUEST\n` +
-          `Customer: ${from}\n` +
-          `Details: ${body}`
+          `💷 NEW QUOTE REQUEST\n\n` +
+          `📞 Customer: ${from}\n` +
+          `🔧 Details:\n${body}\n\n` +
+          `📋 Request: QUOTE\n\n` +
+          `Customer has been informed that you've received the request.`
       });
 
       await redisClient.del(from);
+
+      await client.messages.create({
+        from: to,
+        to: from,
+        body:
+          "Thanks, we've received your quote request. 👍\n\n" +
+          "We've sent the details you've provided, along with your contact " +
+          "number, directly to the plumber.\n\n" +
+          "They've been alerted and will review the information before getting back to you.\n\n" +
+          "If they need any additional information before providing a quote, " +
+          "they'll contact you directly."
+      });
 
       return res.send("<Response></Response>");
     }

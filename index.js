@@ -19,10 +19,8 @@ const {
 const requiredEnvironmentVariables = [
   "TWILIO_ACCOUNT_SID",
   "TWILIO_AUTH_TOKEN",
-  "TWILIO_PHONE_NUMBER",
   "PLUMBER_PHONE_NUMBER",
   "TWILIO_US_NUMBER",
-  "TWILIO_UK_NUMBER",
   "REDIS_URL"
 ];
 

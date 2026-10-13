@@ -199,6 +199,16 @@ app.post("/twilio", async (req, res) => {
           console.log("Duplicate Twilio webhook delivery ignored");
           return res.status(200).type("text/xml").send("<Response></Response>");
         }
+
+        // The key may have expired between SET NX and GET; reacquire before processing.
+        const retryLockAcquired = await redisClient.set(idempotencyKey, "processing", {
+          NX: true,
+          EX: 120
+        });
+
+        if (retryLockAcquired !== "OK") {
+          return res.status(503).type("text/xml").send("<Response></Response>");
+        }
       }
 
       // Mark successful HTTP responses as completed; allow retries after server errors.
@@ -305,7 +315,7 @@ app.post("/twilio", async (req, res) => {
        YES REPLY
     ========================== */
 
-    if (incomingMsg === "yes") {
+    if (incomingMsg === "yes" && !state) {
 
       await client.messages.create({
         from: to,
@@ -325,7 +335,7 @@ app.post("/twilio", async (req, res) => {
        OPTION 1 - EMERGENCY
     ========================== */
 
-    if (incomingMsg === "1") {
+    if (incomingMsg === "1" && !state) {
 
       await redisClient.set(
         stateKey,
@@ -347,7 +357,7 @@ app.post("/twilio", async (req, res) => {
        OPTION 2 - NON URGENT
     ========================== */
 
-    if (incomingMsg === "2") {
+    if (incomingMsg === "2" && !state) {
 
       await redisClient.set(
         stateKey,
@@ -369,7 +379,7 @@ app.post("/twilio", async (req, res) => {
        OPTION 3 - QUOTE
     ========================== */
 
-    if (incomingMsg === "3") {
+    if (incomingMsg === "3" && !state) {
 
       await redisClient.set(
         stateKey,

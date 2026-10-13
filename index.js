@@ -13,7 +13,8 @@ const {
   PLUMBER_PHONE_NUMBER,
   TWILIO_US_NUMBER,
   TWILIO_UK_NUMBER,
-  REDIS_URL
+  REDIS_URL,
+  TENANT_CONFIG_JSON
 } = process.env;
 
 const requiredEnvironmentVariables = [
@@ -33,6 +34,81 @@ if (missingEnvironmentVariables.length > 0) {
     `Startup configuration error: missing required environment variable(s): ${missingEnvironmentVariables.join(", ")}`
   );
   process.exit(1);
+}
+
+/* =========================
+   TENANT CONFIGURATION
+========================= */
+
+function normalizePhoneNumber(value) {
+  return typeof value === "string"
+    ? value.trim().replace(/[^\\d+]/g, "")
+    : "";
+}
+
+let tenantConfigs = null;
+
+if (TENANT_CONFIG_JSON && TENANT_CONFIG_JSON.trim()) {
+  try {
+    const parsedTenantConfigs = JSON.parse(TENANT_CONFIG_JSON);
+
+    if (
+      !parsedTenantConfigs ||
+      typeof parsedTenantConfigs !== "object" ||
+      Array.isArray(parsedTenantConfigs)
+    ) {
+      throw new Error("Tenant configuration must be a JSON object");
+    }
+
+    tenantConfigs = new Map();
+
+    for (const [twilioNumber, config] of Object.entries(parsedTenantConfigs)) {
+      const normalizedTwilioNumber = normalizePhoneNumber(twilioNumber);
+      const plumberPhoneNumber = normalizePhoneNumber(config?.plumberPhoneNumber);
+
+      if (!normalizedTwilioNumber || !plumberPhoneNumber) {
+        throw new Error(
+          "Each tenant must have a valid Twilio number and plumberPhoneNumber"
+        );
+      }
+
+      tenantConfigs.set(normalizedTwilioNumber, {
+        plumberPhoneNumber,
+        region: config.region === "US" ? "US" : "UK"
+      });
+    }
+
+    if (tenantConfigs.size === 0) {
+      throw new Error("At least one tenant must be configured");
+    }
+  } catch (err) {
+    console.error("Startup configuration error: invalid TENANT_CONFIG_JSON:", err.message);
+    process.exit(1);
+  }
+}
+
+function getTenantConfig(twilioNumber) {
+  const normalizedTwilioNumber = normalizePhoneNumber(twilioNumber);
+
+  if (tenantConfigs) {
+    return tenantConfigs.get(normalizedTwilioNumber) || null;
+  }
+
+  // Backwards-compatible single-plumber configuration.
+  if (
+    normalizedTwilioNumber === normalizePhoneNumber(TWILIO_US_NUMBER) ||
+    (TWILIO_UK_NUMBER &&
+      normalizedTwilioNumber === normalizePhoneNumber(TWILIO_UK_NUMBER))
+  ) {
+    return {
+      plumberPhoneNumber: PLUMBER_PHONE_NUMBER,
+      region: normalizedTwilioNumber === normalizePhoneNumber(TWILIO_US_NUMBER)
+        ? "US"
+        : "UK"
+    };
+  }
+
+  return null;
 }
 
 /* =========================
@@ -106,10 +182,19 @@ app.post("/twilio", async (req, res) => {
     const incomingMsg = body.trim().toLowerCase();
 
     // GET USER STATE FROM REDIS
-    const state = await redisClient.get(from);
+    // Scope each conversation to both the customer and the Twilio number.
+    const stateKey = `conversation:${normalizePhoneNumber(to)}:${normalizePhoneNumber(from)}`;
+    const state = await redisClient.get(stateKey);
 
-    // NUMBER CHECK
-    const isUSNumber = to.trim() === TWILIO_US_NUMBER;
+    const tenantConfig = getTenantConfig(to);
+
+    if (!tenantConfig) {
+      console.error("Twilio webhook rejected: no tenant configured for receiving number");
+      return res.status(404).type("text/xml").send("<Response></Response>");
+    }
+
+    const plumberPhoneNumber = tenantConfig.plumberPhoneNumber;
+    const isUSNumber = tenantConfig.region === "US";
 
     /* =========================
        LOGGING
@@ -135,7 +220,7 @@ app.post("/twilio", async (req, res) => {
       incomingMsg === "exit"
     ) {
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -161,7 +246,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `📸 Customer sent images\n` +
           `Number: ${from}\n\n` +
@@ -198,7 +283,7 @@ app.post("/twilio", async (req, res) => {
     if (incomingMsg === "1") {
 
       await redisClient.set(
-        from,
+        stateKey,
         "awaiting_emergency_description"
       );
 
@@ -220,7 +305,7 @@ app.post("/twilio", async (req, res) => {
     if (incomingMsg === "2") {
 
       await redisClient.set(
-        from,
+        stateKey,
         "awaiting_nonurgent_description"
       );
 
@@ -242,7 +327,7 @@ app.post("/twilio", async (req, res) => {
     if (incomingMsg === "3") {
 
       await redisClient.set(
-        from,
+        stateKey,
         "awaiting_quote"
       );
 
@@ -268,7 +353,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `🚨 NEW EMERGENCY LEAD\n\n` +
           `📞 Customer: ${from}\n` +
@@ -277,7 +362,7 @@ app.post("/twilio", async (req, res) => {
           `Customer has been informed that you've been alerted.`
       });
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -302,7 +387,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `🔧 NEW NON-URGENT LEAD\n\n` +
           `📞 Customer: ${from}\n` +
@@ -311,7 +396,7 @@ app.post("/twilio", async (req, res) => {
           `Customer has been informed that you've received the details.`
       });
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -335,7 +420,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `💷 NEW QUOTE REQUEST\n\n` +
           `📞 Customer: ${from}\n` +
@@ -344,7 +429,7 @@ app.post("/twilio", async (req, res) => {
           `Customer has been informed that you've received the request.`
       });
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -375,7 +460,7 @@ app.post("/twilio", async (req, res) => {
 
     await client.messages.create({
       from: to,
-      to: PLUMBER_PHONE_NUMBER,
+      to: plumberPhoneNumber,
       body:
         `📞 Missed call lead\n` +
         `Number: ${from}`

@@ -25,7 +25,6 @@ const {
 const requiredEnvironmentVariables = [
   "TWILIO_ACCOUNT_SID",
   "TWILIO_AUTH_TOKEN",
-  "TWILIO_US_NUMBER",
   "REDIS_URL"
 ];
 
@@ -50,6 +49,10 @@ function normalizePhoneNumber(value) {
     : "";
 }
 
+function isValidE164PhoneNumber(value) {
+  return /^\+[1-9]\d{7,14}$/.test(value);
+}
+
 let tenantConfigs = null;
 
 if (TENANT_CONFIG_JSON && TENANT_CONFIG_JSON.trim()) {
@@ -70,15 +73,22 @@ if (TENANT_CONFIG_JSON && TENANT_CONFIG_JSON.trim()) {
       const normalizedTwilioNumber = normalizePhoneNumber(twilioNumber);
       const plumberPhoneNumber = normalizePhoneNumber(config?.plumberPhoneNumber);
 
-      if (!normalizedTwilioNumber || !plumberPhoneNumber) {
+      if (
+        !isValidE164PhoneNumber(normalizedTwilioNumber) ||
+        !isValidE164PhoneNumber(plumberPhoneNumber)
+      ) {
         throw new Error(
-          "Each tenant must have a valid Twilio number and plumberPhoneNumber"
+          "Each tenant must have valid E.164 Twilio and plumber phone numbers"
         );
+      }
+
+      if (config.region !== "US" && config.region !== "UK") {
+        throw new Error('Each tenant region must be exactly "US" or "UK"');
       }
 
       tenantConfigs.set(normalizedTwilioNumber, {
         plumberPhoneNumber,
-        region: config.region === "US" ? "US" : "UK"
+        region: config.region
       });
     }
 
@@ -115,11 +125,24 @@ function getTenantConfig(twilioNumber) {
   return null;
 }
 
-if (!tenantConfigs && !normalizePhoneNumber(PLUMBER_PHONE_NUMBER)) {
-  console.error(
-    "Startup configuration error: PLUMBER_PHONE_NUMBER is required when TENANT_CONFIG_JSON is not configured"
-  );
-  process.exit(1);
+if (!tenantConfigs) {
+  const missingLegacyConfig = [];
+
+  if (!isValidE164PhoneNumber(normalizePhoneNumber(TWILIO_US_NUMBER))) {
+    missingLegacyConfig.push("TWILIO_US_NUMBER");
+  }
+
+  if (!isValidE164PhoneNumber(normalizePhoneNumber(PLUMBER_PHONE_NUMBER))) {
+    missingLegacyConfig.push("PLUMBER_PHONE_NUMBER");
+  }
+
+  if (missingLegacyConfig.length > 0) {
+    console.error(
+      "Startup configuration error: valid E.164 value(s) required when TENANT_CONFIG_JSON is not configured: " +
+      missingLegacyConfig.join(", ")
+    );
+    process.exit(1);
+  }
 }
 
 /* =========================
@@ -264,15 +287,15 @@ app.post("/twilio", async (req, res) => {
     const incomingMsg = body.trim().toLowerCase();
 
     // Scope each conversation to both the customer and the Twilio number.
-    const stateKey = `conversation:${normalizedTo}:${normalizedFrom}`;
-    const state = await redisClient.get(stateKey);
-
     const tenantConfig = getTenantConfig(normalizedTo);
 
     if (!tenantConfig) {
       console.error("Twilio webhook rejected: no tenant configured for receiving number");
       return res.status(404).type("text/xml").send("<Response></Response>");
     }
+
+    const stateKey = `conversation:${normalizedTo}:${normalizedFrom}`;
+    const state = await redisClient.get(stateKey);
 
     const plumberPhoneNumber = tenantConfig.plumberPhoneNumber;
     const isUSNumber = tenantConfig.region === "US";

@@ -4,7 +4,8 @@
   "description": "Missed call SMS automation for plumbers",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --check index.js"
   },
   "engines": {
     "node": "18.x"

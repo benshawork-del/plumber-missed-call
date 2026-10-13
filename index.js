@@ -116,9 +116,9 @@ function getTenantConfig(twilioNumber) {
   ) {
     return {
       plumberPhoneNumber: PLUMBER_PHONE_NUMBER,
-      region: normalizedTwilioNumber === normalizePhoneNumber(TWILIO_US_NUMBER)
-        ? "US"
-        : "UK"
+      // The initial production number is a UK Twilio number despite the legacy
+      // TWILIO_US_NUMBER variable name. Multi-tenant entries use explicit regions.
+      region: "UK"
     };
   }
 

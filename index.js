@@ -182,17 +182,28 @@ app.post("/twilio", async (req, res) => {
 
     const from = req.body.From;
     const to = req.body.To;
-    const body = req.body.Body || "";
-    const numMedia = parseInt(req.body.NumMedia || "0");
+    const body = typeof req.body.Body === "string" ? req.body.Body : "";
+    const parsedNumMedia = Number.parseInt(req.body.NumMedia || "0", 10);
+    const numMedia = Number.isInteger(parsedNumMedia) && parsedNumMedia > 0
+      ? Math.min(parsedNumMedia, 10)
+      : 0;
+
+    // Reject malformed webhook payloads before touching Redis or sending messages.
+    const normalizedFrom = normalizePhoneNumber(from);
+    const normalizedTo = normalizePhoneNumber(to);
+
+    if (!normalizedFrom || !normalizedTo || !normalizedFrom.startsWith("+") || !normalizedTo.startsWith("+")) {
+      console.warn("Twilio webhook rejected: missing or invalid From/To number");
+      return res.status(400).type("text/xml").send("<Response></Response>");
+    }
 
     const incomingMsg = body.trim().toLowerCase();
 
-    // GET USER STATE FROM REDIS
     // Scope each conversation to both the customer and the Twilio number.
-    const stateKey = `conversation:${normalizePhoneNumber(to)}:${normalizePhoneNumber(from)}`;
+    const stateKey = `conversation:${normalizedTo}:${normalizedFrom}`;
     const state = await redisClient.get(stateKey);
 
-    const tenantConfig = getTenantConfig(to);
+    const tenantConfig = getTenantConfig(normalizedTo);
 
     if (!tenantConfig) {
       console.error("Twilio webhook rejected: no tenant configured for receiving number");
@@ -206,15 +217,10 @@ app.post("/twilio", async (req, res) => {
        LOGGING
     ========================== */
 
-    console.log("Incoming from:", from);
-    console.log("Twilio number used:", to);
-    console.log("Message body:", body);
+    // Avoid logging customer phone numbers, message contents, or conversation state.
+    console.log("Incoming Twilio message accepted for configured tenant");
     console.log("Media count:", numMedia);
-    console.log("User state:", state);
-
-    if (!from) {
-      return res.send("<Response></Response>");
-    }
+    console.log("Conversation state:", state || "none");
 
     /* =========================
        STOP / CANCEL
@@ -482,9 +488,10 @@ app.post("/twilio", async (req, res) => {
 
   } catch (err) {
 
-    console.error("Webhook error:", err);
+    console.error("Webhook processing error:", err.message);
 
-    res.send("<Response></Response>");
+    // A non-2xx response makes delivery failure visible to Twilio and monitoring.
+    res.status(500).type("text/xml").send("<Response></Response>");
   }
 });
 

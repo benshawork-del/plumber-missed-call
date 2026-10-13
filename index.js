@@ -6,6 +6,10 @@ const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 
+if (!process.env.TWILIO_WEBHOOK_URL) {
+  console.warn("TWILIO_WEBHOOK_URL is not configured; Twilio signature validation is disabled");
+}
+
 const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
@@ -14,7 +18,8 @@ const {
   TWILIO_US_NUMBER,
   TWILIO_UK_NUMBER,
   REDIS_URL,
-  TENANT_CONFIG_JSON
+  TENANT_CONFIG_JSON,
+  TWILIO_WEBHOOK_URL
 } = process.env;
 
 const requiredEnvironmentVariables = [
@@ -174,6 +179,22 @@ app.get("/health", (req, res) => {
 app.post("/twilio", async (req, res) => {
 
   try {
+
+    // Verify Twilio's signature when the exact externally configured webhook URL is set.
+    if (TWILIO_WEBHOOK_URL) {
+      const signature = req.get("X-Twilio-Signature") || "";
+      const signatureIsValid = twilio.validateRequest(
+        TWILIO_AUTH_TOKEN,
+        signature,
+        TWILIO_WEBHOOK_URL,
+        req.body
+      );
+
+      if (!signatureIsValid) {
+        console.warn("Twilio webhook rejected: signature validation failed");
+        return res.status(403).type("text/xml").send("<Response></Response>");
+      }
+    }
 
     if (!redisClient.isReady) {
       console.error("Twilio webhook rejected because Redis is unavailable");

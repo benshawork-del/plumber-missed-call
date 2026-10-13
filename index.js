@@ -41,7 +41,7 @@ if (missingEnvironmentVariables.length > 0) {
 
 function normalizePhoneNumber(value) {
   return typeof value === "string"
-    ? value.trim().replace(/[^\\d+]/g, "")
+    ? value.trim().replace(/[^\d+]/g, "")
     : "";
 }
 

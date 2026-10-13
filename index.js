@@ -6,6 +6,10 @@ const app = express();
 
 app.use(express.urlencoded({ extended: false }));
 
+if (!process.env.TWILIO_WEBHOOK_URL) {
+  console.warn("TWILIO_WEBHOOK_URL is not configured; /twilio requests will be rejected");
+}
+
 const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
@@ -13,14 +17,14 @@ const {
   PLUMBER_PHONE_NUMBER,
   TWILIO_US_NUMBER,
   TWILIO_UK_NUMBER,
-  REDIS_URL
+  REDIS_URL,
+  TENANT_CONFIG_JSON,
+  TWILIO_WEBHOOK_URL
 } = process.env;
 
 const requiredEnvironmentVariables = [
   "TWILIO_ACCOUNT_SID",
   "TWILIO_AUTH_TOKEN",
-  "PLUMBER_PHONE_NUMBER",
-  "TWILIO_US_NUMBER",
   "REDIS_URL"
 ];
 
@@ -33,6 +37,112 @@ if (missingEnvironmentVariables.length > 0) {
     `Startup configuration error: missing required environment variable(s): ${missingEnvironmentVariables.join(", ")}`
   );
   process.exit(1);
+}
+
+/* =========================
+   TENANT CONFIGURATION
+========================= */
+
+function normalizePhoneNumber(value) {
+  return typeof value === "string"
+    ? value.trim().replace(/[^\d+]/g, "")
+    : "";
+}
+
+function isValidE164PhoneNumber(value) {
+  return /^\+[1-9]\d{7,14}$/.test(value);
+}
+
+let tenantConfigs = null;
+
+if (TENANT_CONFIG_JSON && TENANT_CONFIG_JSON.trim()) {
+  try {
+    const parsedTenantConfigs = JSON.parse(TENANT_CONFIG_JSON);
+
+    if (
+      !parsedTenantConfigs ||
+      typeof parsedTenantConfigs !== "object" ||
+      Array.isArray(parsedTenantConfigs)
+    ) {
+      throw new Error("Tenant configuration must be a JSON object");
+    }
+
+    tenantConfigs = new Map();
+
+    for (const [twilioNumber, config] of Object.entries(parsedTenantConfigs)) {
+      const normalizedTwilioNumber = normalizePhoneNumber(twilioNumber);
+      const plumberPhoneNumber = normalizePhoneNumber(config?.plumberPhoneNumber);
+
+      if (
+        !isValidE164PhoneNumber(normalizedTwilioNumber) ||
+        !isValidE164PhoneNumber(plumberPhoneNumber)
+      ) {
+        throw new Error(
+          "Each tenant must have valid E.164 Twilio and plumber phone numbers"
+        );
+      }
+
+      if (config.region !== "US" && config.region !== "UK") {
+        throw new Error('Each tenant region must be exactly "US" or "UK"');
+      }
+
+      tenantConfigs.set(normalizedTwilioNumber, {
+        plumberPhoneNumber,
+        region: config.region
+      });
+    }
+
+    if (tenantConfigs.size === 0) {
+      throw new Error("At least one tenant must be configured");
+    }
+  } catch (err) {
+    console.error("Startup configuration error: invalid TENANT_CONFIG_JSON:", err.message);
+    process.exit(1);
+  }
+}
+
+function getTenantConfig(twilioNumber) {
+  const normalizedTwilioNumber = normalizePhoneNumber(twilioNumber);
+
+  if (tenantConfigs) {
+    return tenantConfigs.get(normalizedTwilioNumber) || null;
+  }
+
+  // Backwards-compatible single-plumber configuration.
+  if (
+    normalizedTwilioNumber === normalizePhoneNumber(TWILIO_US_NUMBER) ||
+    (TWILIO_UK_NUMBER &&
+      normalizedTwilioNumber === normalizePhoneNumber(TWILIO_UK_NUMBER))
+  ) {
+    return {
+      plumberPhoneNumber: PLUMBER_PHONE_NUMBER,
+      // The initial production number is a UK Twilio number despite the legacy
+      // TWILIO_US_NUMBER variable name. Multi-tenant entries use explicit regions.
+      region: "UK"
+    };
+  }
+
+  return null;
+}
+
+if (!tenantConfigs) {
+  const missingLegacyConfig = [];
+
+  if (!isValidE164PhoneNumber(normalizePhoneNumber(TWILIO_US_NUMBER))) {
+    missingLegacyConfig.push("TWILIO_US_NUMBER");
+  }
+
+  if (!isValidE164PhoneNumber(normalizePhoneNumber(PLUMBER_PHONE_NUMBER))) {
+    missingLegacyConfig.push("PLUMBER_PHONE_NUMBER");
+  }
+
+  if (missingLegacyConfig.length > 0) {
+    console.error(
+      "Startup configuration error: valid E.164 value(s) required when TENANT_CONFIG_JSON is not configured: " +
+      missingLegacyConfig.join(", ")
+    );
+    process.exit(1);
+  }
 }
 
 /* =========================
@@ -93,37 +203,118 @@ app.post("/twilio", async (req, res) => {
 
   try {
 
+    // Signature validation is mandatory in production. The configured URL must
+    // exactly match the public URL configured in Twilio, including scheme and path.
+    if (!TWILIO_WEBHOOK_URL) {
+      console.error("Twilio webhook unavailable: TWILIO_WEBHOOK_URL is not configured");
+      return res.status(503).type("text/xml").send("<Response></Response>");
+    }
+
+    const signature = req.get("X-Twilio-Signature") || "";
+    const signatureIsValid = twilio.validateRequest(
+      TWILIO_AUTH_TOKEN,
+      signature,
+      TWILIO_WEBHOOK_URL,
+      req.body
+    );
+
+    if (!signatureIsValid) {
+      console.warn("Twilio webhook rejected: signature validation failed");
+      return res.status(403).type("text/xml").send("<Response></Response>");
+    }
+
     if (!redisClient.isReady) {
       console.error("Twilio webhook rejected because Redis is unavailable");
       return res.status(503).type("text/xml").send("<Response></Response>");
     }
 
+    // MessageSid is required so every accepted webhook can be deduplicated.
+    const messageSid = typeof req.body.MessageSid === "string"
+      ? req.body.MessageSid.trim()
+      : "";
+
+    if (!/^SM[0-9a-fA-F]{32}$/.test(messageSid)) {
+      console.warn("Twilio webhook rejected: missing or malformed MessageSid");
+      return res.status(400).type("text/xml").send("<Response></Response>");
+    }
+
+    const idempotencyKey = `twilio:message:${messageSid}`;
+    const lockAcquired = await redisClient.set(idempotencyKey, "processing", {
+      NX: true,
+      EX: 300
+    });
+
+    if (lockAcquired !== "OK") {
+      const existingStatus = await redisClient.get(idempotencyKey);
+
+      if (existingStatus === "completed" || existingStatus === "processing") {
+        console.log("Duplicate Twilio webhook delivery ignored");
+        return res.status(200).type("text/xml").send("<Response></Response>");
+      }
+
+      // The key may have expired between SET NX and GET; reacquire before processing.
+      const retryLockAcquired = await redisClient.set(idempotencyKey, "processing", {
+        NX: true,
+        EX: 300
+      });
+
+      if (retryLockAcquired !== "OK") {
+        return res.status(503).type("text/xml").send("<Response></Response>");
+      }
+    }
+
+    // Mark successful HTTP responses as completed; allow retries after server errors.
+    res.once("finish", () => {
+      const updateIdempotencyState = res.statusCode >= 500
+        ? redisClient.del(idempotencyKey)
+        : redisClient.set(idempotencyKey, "completed", { EX: 604800 });
+
+      updateIdempotencyState.catch((err) => {
+        console.error("Unable to update webhook idempotency state:", err.message);
+      });
+    });
+
     const from = req.body.From;
     const to = req.body.To;
-    const body = req.body.Body || "";
-    const numMedia = parseInt(req.body.NumMedia || "0");
+    const body = typeof req.body.Body === "string" ? req.body.Body : "";
+    const parsedNumMedia = Number.parseInt(req.body.NumMedia || "0", 10);
+    const numMedia = Number.isInteger(parsedNumMedia) && parsedNumMedia > 0
+      ? Math.min(parsedNumMedia, 10)
+      : 0;
+
+    // Reject malformed webhook payloads before touching Redis or sending messages.
+    const normalizedFrom = normalizePhoneNumber(from);
+    const normalizedTo = normalizePhoneNumber(to);
+
+    if (!normalizedFrom || !normalizedTo || !normalizedFrom.startsWith("+") || !normalizedTo.startsWith("+")) {
+      console.warn("Twilio webhook rejected: missing or invalid From/To number");
+      return res.status(400).type("text/xml").send("<Response></Response>");
+    }
 
     const incomingMsg = body.trim().toLowerCase();
 
-    // GET USER STATE FROM REDIS
-    const state = await redisClient.get(from);
+    // Scope each conversation to both the customer and the Twilio number.
+    const tenantConfig = getTenantConfig(normalizedTo);
 
-    // NUMBER CHECK
-    const isUSNumber = to.trim() === TWILIO_US_NUMBER;
+    if (!tenantConfig) {
+      console.error("Twilio webhook rejected: no tenant configured for receiving number");
+      return res.status(404).type("text/xml").send("<Response></Response>");
+    }
+
+    const stateKey = `conversation:${normalizedTo}:${normalizedFrom}`;
+    const state = await redisClient.get(stateKey);
+
+    const plumberPhoneNumber = tenantConfig.plumberPhoneNumber;
+    const isUSNumber = tenantConfig.region === "US";
 
     /* =========================
        LOGGING
     ========================== */
 
-    console.log("Incoming from:", from);
-    console.log("Twilio number used:", to);
-    console.log("Message body:", body);
+    // Avoid logging customer phone numbers, message contents, or conversation state.
+    console.log("Incoming Twilio message accepted for configured tenant");
     console.log("Media count:", numMedia);
-    console.log("User state:", state);
-
-    if (!from) {
-      return res.send("<Response></Response>");
-    }
+    console.log("Conversation state:", state || "none");
 
     /* =========================
        STOP / CANCEL
@@ -135,7 +326,7 @@ app.post("/twilio", async (req, res) => {
       incomingMsg === "exit"
     ) {
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -161,7 +352,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `📸 Customer sent images\n` +
           `Number: ${from}\n\n` +
@@ -175,7 +366,7 @@ app.post("/twilio", async (req, res) => {
        YES REPLY
     ========================== */
 
-    if (incomingMsg === "yes") {
+    if (incomingMsg === "yes" && !state) {
 
       await client.messages.create({
         from: to,
@@ -195,10 +386,10 @@ app.post("/twilio", async (req, res) => {
        OPTION 1 - EMERGENCY
     ========================== */
 
-    if (incomingMsg === "1") {
+    if (incomingMsg === "1" && !state) {
 
       await redisClient.set(
-        from,
+        stateKey,
         "awaiting_emergency_description"
       );
 
@@ -217,10 +408,10 @@ app.post("/twilio", async (req, res) => {
        OPTION 2 - NON URGENT
     ========================== */
 
-    if (incomingMsg === "2") {
+    if (incomingMsg === "2" && !state) {
 
       await redisClient.set(
-        from,
+        stateKey,
         "awaiting_nonurgent_description"
       );
 
@@ -239,10 +430,10 @@ app.post("/twilio", async (req, res) => {
        OPTION 3 - QUOTE
     ========================== */
 
-    if (incomingMsg === "3") {
+    if (incomingMsg === "3" && !state) {
 
       await redisClient.set(
-        from,
+        stateKey,
         "awaiting_quote"
       );
 
@@ -268,7 +459,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `🚨 NEW EMERGENCY LEAD\n\n` +
           `📞 Customer: ${from}\n` +
@@ -277,7 +468,7 @@ app.post("/twilio", async (req, res) => {
           `Customer has been informed that you've been alerted.`
       });
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -302,7 +493,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `🔧 NEW NON-URGENT LEAD\n\n` +
           `📞 Customer: ${from}\n` +
@@ -311,7 +502,7 @@ app.post("/twilio", async (req, res) => {
           `Customer has been informed that you've received the details.`
       });
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -335,7 +526,7 @@ app.post("/twilio", async (req, res) => {
 
       await client.messages.create({
         from: to,
-        to: PLUMBER_PHONE_NUMBER,
+        to: plumberPhoneNumber,
         body:
           `💷 NEW QUOTE REQUEST\n\n` +
           `📞 Customer: ${from}\n` +
@@ -344,7 +535,7 @@ app.post("/twilio", async (req, res) => {
           `Customer has been informed that you've received the request.`
       });
 
-      await redisClient.del(from);
+      await redisClient.del(stateKey);
 
       await client.messages.create({
         from: to,
@@ -375,7 +566,7 @@ app.post("/twilio", async (req, res) => {
 
     await client.messages.create({
       from: to,
-      to: PLUMBER_PHONE_NUMBER,
+      to: plumberPhoneNumber,
       body:
         `📞 Missed call lead\n` +
         `Number: ${from}`
@@ -391,9 +582,10 @@ app.post("/twilio", async (req, res) => {
 
   } catch (err) {
 
-    console.error("Webhook error:", err);
+    console.error("Webhook processing error:", err.message);
 
-    res.send("<Response></Response>");
+    // A non-2xx response makes delivery failure visible to Twilio and monitoring.
+    res.status(500).type("text/xml").send("<Response></Response>");
   }
 });
 

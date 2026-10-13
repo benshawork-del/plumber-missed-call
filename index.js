@@ -7,7 +7,7 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 
 if (!process.env.TWILIO_WEBHOOK_URL) {
-  console.warn("TWILIO_WEBHOOK_URL is not configured; Twilio signature validation is disabled");
+  console.warn("TWILIO_WEBHOOK_URL is not configured; /twilio requests will be rejected");
 }
 
 const {
@@ -203,20 +203,24 @@ app.post("/twilio", async (req, res) => {
 
   try {
 
-    // Verify Twilio's signature when the exact externally configured webhook URL is set.
-    if (TWILIO_WEBHOOK_URL) {
-      const signature = req.get("X-Twilio-Signature") || "";
-      const signatureIsValid = twilio.validateRequest(
-        TWILIO_AUTH_TOKEN,
-        signature,
-        TWILIO_WEBHOOK_URL,
-        req.body
-      );
+    // Signature validation is mandatory in production. The configured URL must
+    // exactly match the public URL configured in Twilio, including scheme and path.
+    if (!TWILIO_WEBHOOK_URL) {
+      console.error("Twilio webhook unavailable: TWILIO_WEBHOOK_URL is not configured");
+      return res.status(503).type("text/xml").send("<Response></Response>");
+    }
 
-      if (!signatureIsValid) {
-        console.warn("Twilio webhook rejected: signature validation failed");
-        return res.status(403).type("text/xml").send("<Response></Response>");
-      }
+    const signature = req.get("X-Twilio-Signature") || "";
+    const signatureIsValid = twilio.validateRequest(
+      TWILIO_AUTH_TOKEN,
+      signature,
+      TWILIO_WEBHOOK_URL,
+      req.body
+    );
+
+    if (!signatureIsValid) {
+      console.warn("Twilio webhook rejected: signature validation failed");
+      return res.status(403).type("text/xml").send("<Response></Response>");
     }
 
     if (!redisClient.isReady) {

@@ -228,48 +228,51 @@ app.post("/twilio", async (req, res) => {
       return res.status(503).type("text/xml").send("<Response></Response>");
     }
 
-    // Twilio retries webhook deliveries. Use MessageSid to suppress duplicate processing.
+    // MessageSid is required so every accepted webhook can be deduplicated.
     const messageSid = typeof req.body.MessageSid === "string"
       ? req.body.MessageSid.trim()
       : "";
 
-    if (messageSid) {
-      const idempotencyKey = `twilio:message:${messageSid}`;
-      const lockAcquired = await redisClient.set(idempotencyKey, "processing", {
-        NX: true,
-        EX: 120
-      });
+    if (!/^SM[0-9a-fA-F]{32}$/.test(messageSid)) {
+      console.warn("Twilio webhook rejected: missing or malformed MessageSid");
+      return res.status(400).type("text/xml").send("<Response></Response>");
+    }
 
-      if (lockAcquired !== "OK") {
-        const existingStatus = await redisClient.get(idempotencyKey);
+    const idempotencyKey = `twilio:message:${messageSid}`;
+    const lockAcquired = await redisClient.set(idempotencyKey, "processing", {
+      NX: true,
+      EX: 300
+    });
 
-        if (existingStatus === "completed" || existingStatus === "processing") {
-          console.log("Duplicate Twilio webhook delivery ignored");
-          return res.status(200).type("text/xml").send("<Response></Response>");
-        }
+    if (lockAcquired !== "OK") {
+      const existingStatus = await redisClient.get(idempotencyKey);
 
-        // The key may have expired between SET NX and GET; reacquire before processing.
-        const retryLockAcquired = await redisClient.set(idempotencyKey, "processing", {
-          NX: true,
-          EX: 120
-        });
-
-        if (retryLockAcquired !== "OK") {
-          return res.status(503).type("text/xml").send("<Response></Response>");
-        }
+      if (existingStatus === "completed" || existingStatus === "processing") {
+        console.log("Duplicate Twilio webhook delivery ignored");
+        return res.status(200).type("text/xml").send("<Response></Response>");
       }
 
-      // Mark successful HTTP responses as completed; allow retries after server errors.
-      res.once("finish", () => {
-        const updateIdempotencyState = res.statusCode >= 500
-          ? redisClient.del(idempotencyKey)
-          : redisClient.set(idempotencyKey, "completed", { EX: 604800 });
-
-        updateIdempotencyState.catch((err) => {
-          console.error("Unable to update webhook idempotency state:", err.message);
-        });
+      // The key may have expired between SET NX and GET; reacquire before processing.
+      const retryLockAcquired = await redisClient.set(idempotencyKey, "processing", {
+        NX: true,
+        EX: 300
       });
+
+      if (retryLockAcquired !== "OK") {
+        return res.status(503).type("text/xml").send("<Response></Response>");
+      }
     }
+
+    // Mark successful HTTP responses as completed; allow retries after server errors.
+    res.once("finish", () => {
+      const updateIdempotencyState = res.statusCode >= 500
+        ? redisClient.del(idempotencyKey)
+        : redisClient.set(idempotencyKey, "completed", { EX: 604800 });
+
+      updateIdempotencyState.catch((err) => {
+        console.error("Unable to update webhook idempotency state:", err.message);
+      });
+    });
 
     const from = req.body.From;
     const to = req.body.To;

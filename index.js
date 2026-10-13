@@ -20,7 +20,6 @@ const {
 const requiredEnvironmentVariables = [
   "TWILIO_ACCOUNT_SID",
   "TWILIO_AUTH_TOKEN",
-  "PLUMBER_PHONE_NUMBER",
   "TWILIO_US_NUMBER",
   "REDIS_URL"
 ];
@@ -109,6 +108,13 @@ function getTenantConfig(twilioNumber) {
   }
 
   return null;
+}
+
+if (!tenantConfigs && !normalizePhoneNumber(PLUMBER_PHONE_NUMBER)) {
+  console.error(
+    "Startup configuration error: PLUMBER_PHONE_NUMBER is required when TENANT_CONFIG_JSON is not configured"
+  );
+  process.exit(1);
 }
 
 /* =========================
